@@ -31,7 +31,10 @@ FLOAT_OUT = 64      # a linear with at most this many outputs stays float (b_pro
 RENAME = ((r"^attention\.", "self_attn."),
           (r"^self_attn\.(f_proj\.|dt_bias$|A_log$)", r"self_attn.forget_gate.\1"),
           (r"^self_attn\.dense\.", "self_attn.o_proj."),
-          (r"^mlp\.gate\.expert_bias$", "mlp.gate.e_score_correction_bias"))
+          (r"^mlp\.gate\.expert_bias$", "mlp.gate.e_score_correction_bias"),
+          # q_lora_rank (Ling-3.0-tiny): the MLA query is q_b(norm(q_a(x))), held here as one q_proj (see shell)
+          (r"^self_attn\.q_a_proj\.", "self_attn.q_proj.a."), (r"^self_attn\.q_a_layernorm\.", "self_attn.q_proj.norm."),
+          (r"^self_attn\.q_b_proj\.", "self_attn.q_proj.b."))
 
 
 def load_config(hf):
@@ -91,6 +94,12 @@ def shell(cfg, li):
     c.layer_types, c.mlp_layer_types = [cfg.layer_types[li]], [cfg.mlp_layer_types[li]]
     c.num_hidden_layers, c.vocab_size, c.pad_token_id = 1, 8, 0
     m = BailingHybridModel(c)       # ponytail: random init of a layer that is overwritten next; skip it if it shows
+    r, att = getattr(cfg, "q_lora_rank", None), m.layers[0].self_attn
+    if r and cfg.layer_types[li] == "full_attention":   # transformers' attention has the full-rank query only
+        from collections import OrderedDict
+        from transformers.models.bailing_hybrid.modeling_bailing_hybrid import BailingHybridRMSNorm
+        att.q_proj = nn.Sequential(OrderedDict(a=nn.Linear(cfg.hidden_size, r, bias=False), norm=BailingHybridRMSNorm(r),
+                                               b=nn.Linear(r, att.q_proj.out_features, bias=False)))
     m.norm = nn.Identity()
     return m.eval()
 
@@ -102,8 +111,15 @@ def fold_rules(cfg):
     assert r["rotation"], r["reason"]
     tm = tiny_model(cfg)
     tc = tm.config
-    return {(tc.layer_types[i], tc.mlp_layer_types[i]): r["kinds"][signature(L)]
-            for i, L in enumerate(decoder_layers(tm)[1])}
+    kinds = {(tc.layer_types[i], tc.mlp_layer_types[i]): r["kinds"][signature(L)]
+             for i, L in enumerate(decoder_layers(tm)[1])}
+    if getattr(cfg, "q_lora_rank", None):               # the residual reader of a low-rank query is its first factor
+        for (lt, _), rule in kinds.items():
+            for seg in rule:
+                for e in seg["in"]:
+                    if lt == "full_attention" and e[0] == "self_attn.q_proj.weight":
+                        e[0] = "self_attn.q_proj.a.weight"
+    return kinds
 
 
 @torch.no_grad()
