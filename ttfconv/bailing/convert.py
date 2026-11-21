@@ -255,6 +255,13 @@ def convert_layer(m, a, h, hq, hf, dev, dt):
             hooks = [lin.register_forward_pre_hook(
                 (lambda nm: lambda mod, inp: S[nm].add(inp[0].reshape(-1, inp[0].shape[-1]),
                                                        [0, inp[0].numel() // inp[0].shape[-1]]))(n)) for n, lin in dense]
+        if moe and first and a.pool:    # the MoE block's input over every token: what all its experts read, pooled
+            Spool = Stats(1, d, dev)
+
+            def pool_hook(mod, args, kwargs, Spool=Spool):
+                x = args[0] if args else next(iter(kwargs.values()))
+                Spool.add(x.reshape(-1, d), [0, x.numel() // d])
+            hooks.append(L.mlp.register_forward_pre_hook(pool_hook, with_kwargs=True))
         if moe:
             Sgu = RangeStats(E, d, dev, a.chunk, p0, min(p0 + step, E))
 
@@ -273,10 +280,9 @@ def convert_layer(m, a, h, hq, hf, dev, dt):
             if moe:     # the float model's expert choices on the held-out windows, for the agreement figure below
                 ex.forward = lambda x, idx, w: (rf.append(idx.cpu()), experts_forward(ex, x, idx, w))[1]
             advance(hf)
-            if moe and a.pool:      # the shared expert reads the same input as the routed ones, from every token
-                pn = next(n for n, lin in dense if n.startswith("mlp.") and n.endswith("gate_proj")
-                          and lin.in_features == d)
-                Hpool = S[pn].centred(0, 1)[0]
+            if moe and a.pool:
+                Hpool = Spool.centred(0, 1)[0]
+                del Spool
         if not moe:
             break
         st = Sgu.st
