@@ -214,7 +214,7 @@ def convert_layer(m, a, h, hq, hf, dev, dt):
         ex = L.mlp.experts
         E, I, d = ex.num_experts, ex.intermediate_dim, ex.hidden_dim
         step = max(a.chunk, (min(a.experts_pass, E) // a.chunk) * a.chunk)
-        Sdn = Stats(E, I, dev)
+        Sdn = Stats(E, I, dev, a.chunk)
         bias_gu = torch.empty(E, 2 * I, dtype=dt)
         parts, eg, cnt = [], {"main": [], "adapter": []}, 0
     for p0 in (range(0, E, step) if moe else [0]):
@@ -261,15 +261,22 @@ def convert_layer(m, a, h, hq, hf, dev, dt):
     if moe:
         sd["mlp.experts.gate_up_proj"] = _cat_state(parts, pack3)
         errs["mlp.experts.gate_up_proj"] = _err_summary(eg, cnt)
-        W = ex.down_proj.float()
-        Hc, mu, _ = Sdn.centred(0, E)
-        o, Wh, er = convert_group(W, Hc, mu, a.rank, 0.01)
-        sd["mlp.experts.down_proj"] = to_state(o, pack3)
-        errs["mlp.experts.down_proj"] = _err_summary({"main": [er["main"]], "adapter": [er["adapter"]]}, Sdn.cnt)
-        bias = (bias_gu.to(dev), torch.einsum("enk,ek->en", W - Wh, mu).to(dt))
-        ex.down_proj.data = Wh.to(dt)
+        parts, eg, bias_dn = [], {"main": [], "adapter": []}, torch.empty(E, d, dtype=dt, device=dev)
+        for e0 in range(0, E, a.chunk):          # in chunks: all 512 Sante experts at once do not fit a 16 GB device
+            e1 = min(e0 + a.chunk, E)
+            W = ex.down_proj[e0:e1].float()
+            Hc, mu, _ = Sdn.centred(e0, e1)
+            o, Wh, er = convert_group(W, Hc, mu, a.rank, 0.01)
+            bias_dn[e0:e1] = torch.einsum("enk,ek->en", W - Wh, mu).to(dt)
+            ex.down_proj.data[e0:e1] = Wh.to(dt)
+            parts.append({k: v.cpu() for k, v in o.items()})
+            eg["main"].append(er["main"].cpu()); eg["adapter"].append(er["adapter"].cpu())
+            del W, Hc, Wh, o
+        sd["mlp.experts.down_proj"] = _cat_state(parts, pack3)
+        errs["mlp.experts.down_proj"] = _err_summary(eg, Sdn.cnt.cpu())
+        bias = (bias_gu.to(dev), bias_dn)
         ex.forward = lambda x, idx, w: experts_forward(ex, x, idx, w, None, bias)
-        del W, Hc, Wh, Sdn
+        del Sdn
     for n, lin in dense:
         W = lin.weight.float()[None]
         Hc, mu, _ = S[n].centred(0, 1)
