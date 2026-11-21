@@ -51,7 +51,7 @@ def run(d, out, *extra):
             "--mb", "2", "--rank", "4", "--chunk", "2", "--experts-pass", "2", "--device", "cpu", *extra])
 
 
-@pytest.mark.parametrize("extra", [(), ("--no-fold",), ("--pool", "1", "--frank", "4", "--experts-host")])
+@pytest.mark.parametrize("extra", [(), ("--no-fold",), ("--pool", "1", "--frank", "4", "--experts-host", "--router-fit")])
 def test_converts_and_resumes(model_dir, tmp_path, extra):
     d, ref = model_dir
     out = tmp_path / "out"
@@ -68,6 +68,7 @@ def test_converts_and_resumes(model_dir, tmp_path, extra):
     assert "input_layernorm.weight" in L["_float"] and "mlp.gate.weight" in L["_float"]
     er = json.load(open(out / "L5.json"))
     assert 0.0 <= er["_router_agreement"] <= 1.0
+    assert ("_router_fit" in er) == ("--router-fit" in extra)
     if "--frank" in extra:      # the float adapter is stored, and it lowers the error the ternary one left
         gu = er["mlp.experts.gate_up_proj"]
         assert L["mlp.experts.gate_up_proj"]["fa"].shape[-1] == 4 and gu["float"] <= gu["adapter"]

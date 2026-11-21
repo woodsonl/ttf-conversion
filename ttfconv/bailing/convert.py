@@ -227,7 +227,7 @@ def float_state(sd, errs, name, fl, cnt):
 
 
 @torch.no_grad()
-def convert_layer(m, a, h, hq, hf, dev, dt, ho=None):
+def convert_layer(m, a, h, hq, hf, dev, dt, ho=None, hfc=None):
     """m: shell with the (folded) float layer loaded. Returns (state dict, errors). In place: h (the calibration
     windows, which alone feed the statistics) and hq (held-out windows) advance through the converted layer, hf (the
     held-out windows' float stream) through the float one."""
@@ -243,6 +243,7 @@ def convert_layer(m, a, h, hq, hf, dev, dt, ho=None):
     S = {n: Stats(1, lin.in_features, dev) for n, lin in dense}
     moe = hasattr(L.mlp, "experts")
     sd, errs = {}, {}
+    zf = []
     if moe:
         ex = L.mlp.experts
         E, I, d = ex.num_experts, ex.intermediate_dim, ex.hidden_dim
@@ -285,6 +286,15 @@ def convert_layer(m, a, h, hq, hf, dev, dt, ho=None):
             if moe:     # the float model's expert choices on the held-out windows, for the agreement figure below
                 ex.forward = lambda x, idx, w: (rf.append((idx.cpu(), w.cpu())), experts_forward(ex, x, idx, w))[1]
             advance(hf)
+            if hfc is not None:     # the float model's own stream of the calibration windows, and its router logits
+                if moe:
+                    ex.forward = lambda x, idx, w: experts_forward(ex, x, idx, w)
+                    hk = L.mlp.register_forward_pre_hook(lambda mod, args, kwargs: zf.append(F.linear(
+                        (args[0] if args else next(iter(kwargs.values()))).reshape(-1, d).float(),
+                        L.mlp.gate.weight.float()).to("cpu", torch.bfloat16)), with_kwargs=True)
+                advance(hfc)
+                if moe:
+                    hk.remove()
             if moe and a.pool:
                 Hpool = Spool.centred(0, 1)[0]
                 del Spool
@@ -348,6 +358,27 @@ def convert_layer(m, a, h, hq, hf, dev, dt, ho=None):
         lin.weight.data = Wh[0].to(dt)
         lin.bias = nn.Parameter(torch.einsum("enk,ek->en", W - Wh, mu)[0].to(dt), requires_grad=False)
         del S[n]
+    if moe and zf:
+        # router refit, closed form: on the converted layer's own MoE input x_q, reproduce the logits the float router
+        # gave on the float stream: min ||X_q W'^T - Z_f||^2 + mu ||W' - W||^2
+        G, Cx, it = torch.zeros(d, d, device=dev), torch.zeros(d, E, device=dev), iter(zf)
+
+        def fit_hook(mod, args, kwargs):
+            x = (args[0] if args else next(iter(kwargs.values()))).reshape(-1, d).float()
+            G.addmm_(x.T, x); Cx.addmm_(x.T, next(it).to(dev).float())
+        hk = L.mlp.register_forward_pre_hook(fit_hook, with_kwargs=True)
+        ex.forward = lambda x, idx, w: torch.zeros_like(x)      # the block's output is not used in this pass
+        for b0 in range(0, h.shape[0], a.mb):
+            run(h[b0:b0 + a.mb])
+        hk.remove()
+        gw = L.mlp.gate.weight
+        assert gw.shape == (E, d), gw.shape
+        W0 = gw.data.float()
+        mu_r = 1e-2 * torch.diagonal(G).mean()
+        Wn = torch.linalg.solve(G + mu_r * torch.eye(d, device=dev), Cx + mu_r * W0.T).T
+        errs["_router_fit"] = float((Wn - W0).norm() / W0.norm())
+        gw.data = Wn.to(gw.dtype)
+        del G, Cx, zf
     advance(h)
     if moe:
         ex.forward = lambda x, idx, w: (rq.append(idx.cpu()), experts_forward(ex, x, idx, w, None, bias))[1]
@@ -393,6 +424,8 @@ def main(argv=None):
     ap.add_argument("--chunk", type=int, default=32, help="experts per GPTQ batch")
     ap.add_argument("--experts-pass", type=int, default=128, help="experts whose input moments are held at once")
     ap.add_argument("--no-fold", action="store_true")
+    ap.add_argument("--router-fit", action="store_true", help="refit each MoE router so that the converted model "
+                    "routes as the float model does (costs one more stream and two passes per layer)")
     ap.add_argument("--experts-host", action="store_true", help="keep a layer's routed experts in host memory: for a "
                     "layer larger than the device")
     ap.add_argument("--pool", type=float, default=0.0, help="shrink each routed expert's input covariance toward the "
@@ -411,7 +444,7 @@ def main(argv=None):
     cfg = load_config(a.hf)
     nl = a.layers or cfg.num_hidden_layers
     meta = {k: getattr(a, k) for k in ("windows", "seq", "eval_windows", "rank", "seed", "no_fold")}
-    meta.update({k: getattr(a, k) for k in ("pool", "frank") if getattr(a, k)})
+    meta.update({k: getattr(a, k) for k in ("pool", "frank", "router_fit") if getattr(a, k)})
     mp = os.path.join(a.out, "meta.json")
     if os.path.exists(mp):
         assert json.load(open(mp)) == meta, "OUT was started with other settings"
@@ -436,6 +469,8 @@ def main(argv=None):
         hs = {"h": look(ids), "hq": look(ids_e)}
         hs["hf"] = hs["hq"].clone()
         hs["ho"] = hs["hq"].clone()
+        if a.router_fit:
+            hs["hfc"] = hs["h"].clone()
         del emb
     else:
         hs = torch.load(hp, weights_only=True)
@@ -459,7 +494,7 @@ def main(argv=None):
             m.to(dev, dt)
         del ex
         del sd
-        out, errs = convert_layer(m, a, hs["h"], hs["hq"], hs["hf"], dev, dt, hs.get("ho"))
+        out, errs = convert_layer(m, a, hs["h"], hs["hq"], hs["hf"], dev, dt, hs.get("ho"), hs.get("hfc"))
         out["_float"] = {k: v.cpu() for k, v in m.layers[0].state_dict().items()
                          if k not in out and k.rsplit(".", 1)[0] not in out}
         del m
