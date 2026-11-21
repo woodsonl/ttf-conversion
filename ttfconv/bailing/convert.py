@@ -194,6 +194,36 @@ def experts_forward(ex, x, idx, w, cap=None, bias=None):
 
 
 @torch.no_grad()
+def float_adapter(W, Wh, Hc, r):
+    """the rank-r float correction A B of W - Wh that is best in the Hc-weighted norm, in closed form (QERA,
+    arXiv 2410.06040): with Hc = L L^T, A B = svd_r((W - Wh) L) L^-1. Returns (A [E, N, r], B [E, r, K], both bf16 on
+    the CPU; W^ + A B; the relative output error left)."""
+    from ..q38.convert import rsvd_b
+    K = W.shape[-1]
+    eye = torch.eye(K, device=W.device)
+    tr = torch.diagonal(Hc, dim1=-2, dim2=-1).mean(-1)[:, None, None]
+    Lc, info = torch.linalg.cholesky_ex(Hc + (1e-4 * tr + 1e-12) * eye)
+    if int(info.max()):
+        Lc = torch.linalg.cholesky(Hc + (0.05 * tr + 1e-12) * eye)
+    U, S, Vh = rsvd_b((W - Wh) @ Lc, min(r, W.shape[1], K))
+    A = (U * S[:, None, :]).to(torch.bfloat16)
+    B = torch.linalg.solve_triangular(Lc, Vh, upper=False, left=False).to(torch.bfloat16)
+    Wh = Wh + A.float() @ B.float()
+    R = W - Wh
+    e = ((R @ Hc) * R).sum((1, 2)) / ((W @ Hc) * W).sum((1, 2)).clamp_min(1e-30)
+    return A.cpu(), B.cpu(), Wh, e.cpu()
+
+
+def float_state(sd, errs, name, fl, cnt):
+    """the float adapters of one module into its state dict ("fa", "fb"), their usage-weighted error into errs"""
+    if fl["a"]:
+        sd[name].update(fa=torch.cat(fl["a"]), fb=torch.cat(fl["b"]))
+        w = cnt.float() / cnt.float().sum()
+        errs[name]["float"] = float((torch.cat(fl["e"]) * w).sum())
+    return {"a": [], "b": [], "e": []}
+
+
+@torch.no_grad()
 def convert_layer(m, a, h, hq, hf, dev, dt):
     """m: shell with the (folded) float layer loaded. Returns (state dict, errors). In place: h (the calibration
     windows, which alone feed the statistics) and hq (held-out windows) advance through the converted layer, hf (the
@@ -217,6 +247,7 @@ def convert_layer(m, a, h, hq, hf, dev, dt):
         Sdn = Stats(E, I, dev, a.chunk)
         bias_gu = torch.empty(E, 2 * I, dtype=dt)
         parts, eg, cnt = [], {"main": [], "adapter": []}, 0
+        fl, rf, rq, Hpool = {"a": [], "b": [], "e": []}, [], [], None
     for p0 in (range(0, E, step) if moe else [0]):
         first = p0 == 0
         hooks = []
@@ -239,7 +270,13 @@ def convert_layer(m, a, h, hq, hf, dev, dt):
         if moe:
             ex.forward = lambda x, idx, w: experts_forward(ex, x, idx, w)
         if first:
+            if moe:     # the float model's expert choices on the held-out windows, for the agreement figure below
+                ex.forward = lambda x, idx, w: (rf.append(idx.cpu()), experts_forward(ex, x, idx, w))[1]
             advance(hf)
+            if moe and a.pool:      # the shared expert reads the same input as the routed ones, from every token
+                pn = next(n for n, lin in dense if n.startswith("mlp.") and n.endswith("gate_proj")
+                          and lin.in_features == d)
+                Hpool = S[pn].centred(0, 1)[0]
         if not moe:
             break
         st = Sgu.st
@@ -248,7 +285,13 @@ def convert_layer(m, a, h, hq, hf, dev, dt):
             W = ex.gate_up_proj[e0:e1].float()
             Hc, mu, _ = st.centred(e0, e1)
             st.H[e0 // a.chunk] = None
+            if Hpool is not None:   # an expert with few tokens leans on the layer's pooled covariance
+                wp = (a.pool * d / (a.pool * d + st.cnt[e0:e1].float()))[:, None, None]
+                Hc = (1 - wp) * Hc + wp * Hpool
             o, Wh, er = convert_group(W, Hc, mu, a.rank, 0.05 if int(st.cnt[e0:e1].min()) < 2 * d else 0.01)
+            if a.frank:
+                fa, fb, Wh, ef = float_adapter(W, Wh, Hc, a.frank)
+                fl["a"].append(fa); fl["b"].append(fb); fl["e"].append(ef)
             bias_gu[e0:e1] = torch.einsum("enk,ek->en", W - Wh, mu).to("cpu", dt)
             # in place: the float experts are only needed by the first pass (the down projection's inputs, hf); the
             # later passes read the experts' inputs, which do not depend on the experts' weights
@@ -261,12 +304,16 @@ def convert_layer(m, a, h, hq, hf, dev, dt):
     if moe:
         sd["mlp.experts.gate_up_proj"] = _cat_state(parts, pack3)
         errs["mlp.experts.gate_up_proj"] = _err_summary(eg, cnt)
+        fl = float_state(sd, errs, "mlp.experts.gate_up_proj", fl, cnt)
         parts, eg, bias_dn = [], {"main": [], "adapter": []}, torch.empty(E, d, dtype=dt, device=dev)
         for e0 in range(0, E, a.chunk):          # in chunks: all 512 Sante experts at once do not fit a 16 GB device
             e1 = min(e0 + a.chunk, E)
             W = ex.down_proj[e0:e1].float()
             Hc, mu, _ = Sdn.centred(e0, e1)
             o, Wh, er = convert_group(W, Hc, mu, a.rank, 0.01)
+            if a.frank:
+                fa, fb, Wh, ef = float_adapter(W, Wh, Hc, a.frank)
+                fl["a"].append(fa); fl["b"].append(fb); fl["e"].append(ef)
             bias_dn[e0:e1] = torch.einsum("enk,ek->en", W - Wh, mu).to(dt)
             ex.down_proj.data[e0:e1] = Wh.to(dt)
             parts.append({k: v.cpu() for k, v in o.items()})
@@ -274,6 +321,7 @@ def convert_layer(m, a, h, hq, hf, dev, dt):
             del W, Hc, Wh, o
         sd["mlp.experts.down_proj"] = _cat_state(parts, pack3)
         errs["mlp.experts.down_proj"] = _err_summary(eg, Sdn.cnt.cpu())
+        float_state(sd, errs, "mlp.experts.down_proj", fl, Sdn.cnt.cpu())
         bias = (bias_gu.to(dev), bias_dn)
         ex.forward = lambda x, idx, w: experts_forward(ex, x, idx, w, None, bias)
         del Sdn
@@ -283,10 +331,19 @@ def convert_layer(m, a, h, hq, hf, dev, dt):
         o, Wh, er = convert_group(W, Hc, mu, a.rank, 0.01)
         sd[n] = to_state(o, pack3)
         errs[n] = {"main": float(er["main"][0]), "adapter": float(er["adapter"][0])}
+        if a.frank:
+            fa, fb, Wh, ef = float_adapter(W, Wh, Hc, a.frank)
+            float_state(sd, errs, n, {"a": [fa], "b": [fb], "e": [ef]}, torch.ones(1))
         lin.weight.data = Wh[0].to(dt)
         lin.bias = nn.Parameter(torch.einsum("enk,ek->en", W - Wh, mu)[0].to(dt), requires_grad=False)
         del S[n]
-    advance(h); advance(hq)
+    advance(h)
+    if moe:
+        ex.forward = lambda x, idx, w: (rq.append(idx.cpu()), experts_forward(ex, x, idx, w, None, bias))[1]
+    advance(hq)
+    if moe:     # per held-out token, the share of the float model's experts that the converted model also picks
+        errs["_router_agreement"] = float(torch.cat([(f[:, :, None] == q[:, None, :]).any(-1).float().mean(-1)
+                                                     for f, q in zip(rf, rq)]).mean())
     return sd, errs
 
 
@@ -319,6 +376,10 @@ def main(argv=None):
     ap.add_argument("--chunk", type=int, default=32, help="experts per GPTQ batch")
     ap.add_argument("--experts-pass", type=int, default=128, help="experts whose input moments are held at once")
     ap.add_argument("--no-fold", action="store_true")
+    ap.add_argument("--pool", type=float, default=0.0, help="shrink each routed expert's input covariance toward the "
+                    "layer's pooled one, with weight pool*d / (pool*d + the expert's tokens); 0 = off")
+    ap.add_argument("--frank", type=int, default=0, help="rank of a closed-form float adapter on every ternary "
+                    "matrix, on top of the ternary one; 0 = off")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--threads", type=int, default=0)
     a = ap.parse_args(argv)
@@ -331,6 +392,7 @@ def main(argv=None):
     cfg = load_config(a.hf)
     nl = a.layers or cfg.num_hidden_layers
     meta = {k: getattr(a, k) for k in ("windows", "seq", "eval_windows", "rank", "seed", "no_fold")}
+    meta.update({k: getattr(a, k) for k in ("pool", "frank") if getattr(a, k)})
     mp = os.path.join(a.out, "meta.json")
     if os.path.exists(mp):
         assert json.load(open(mp)) == meta, "OUT was started with other settings"
@@ -380,7 +442,9 @@ def main(argv=None):
         json.dump(errs, open(os.path.join(a.out, f"L{li}.json"), "w"), indent=1)
         peak = f"; GPU peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB" if dev.startswith("cuda") else ""
         log(f"layer {li} ({cfg.layer_types[li]}, {cfg.mlp_layer_types[li]}): {time.time() - t0:.0f}s; rel out err "
-            + " ".join(f"{n.split('.')[-1]} {v['main']:.3f}->{v['adapter']:.3f}" for n, v in errs.items())
+            + " ".join(f"{n.split('.')[-1]} {v['main']:.3f}->{v['adapter']:.3f}"
+                       + (f"->{v['float']:.3f}" if "float" in v else "") for n, v in errs.items() if isinstance(v, dict))
+            + (f"; routing kept {errs['_router_agreement']:.3f}" if "_router_agreement" in errs else "")
             + f"; h rms {float(hs['h'][:2].float().pow(2).mean().sqrt()):.3f}" + peak)
         if dev.startswith("cuda"):
             torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
