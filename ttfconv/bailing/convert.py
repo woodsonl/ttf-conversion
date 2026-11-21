@@ -93,7 +93,9 @@ def shell(cfg, li):
     c = copy.deepcopy(cfg)
     c.layer_types, c.mlp_layer_types = [cfg.layer_types[li]], [cfg.mlp_layer_types[li]]
     c.num_hidden_layers, c.vocab_size, c.pad_token_id = 1, 8, 0
-    m = BailingHybridModel(c)       # ponytail: random init of a layer that is overwritten next; skip it if it shows
+    from transformers.initialization import no_init_weights
+    with no_init_weights():         # every weight is loaded next; an initialised Sante layer is 12 GB of touched fp32
+        m = BailingHybridModel(c)
     r, att = getattr(cfg, "q_lora_rank", None), m.layers[0].self_attn
     if r and cfg.layer_types[li] == "full_attention":   # transformers' attention has the full-rank query only
         from collections import OrderedDict
@@ -213,7 +215,7 @@ def convert_layer(m, a, h, hq, hf, dev, dt):
         E, I, d = ex.num_experts, ex.intermediate_dim, ex.hidden_dim
         step = max(a.chunk, (min(a.experts_pass, E) // a.chunk) * a.chunk)
         Sdn = Stats(E, I, dev)
-        What_gu = torch.empty(E, 2 * I, d, dtype=dt); bias_gu = torch.empty(E, 2 * I, dtype=dt)
+        bias_gu = torch.empty(E, 2 * I, dtype=dt)
         parts, eg, cnt = [], {"main": [], "adapter": []}, 0
     for p0 in (range(0, E, step) if moe else [0]):
         first = p0 == 0
@@ -247,7 +249,10 @@ def convert_layer(m, a, h, hq, hf, dev, dt):
             Hc, mu, _ = st.centred(e0, e1)
             st.H[e0 // a.chunk] = None
             o, Wh, er = convert_group(W, Hc, mu, a.rank, 0.05 if int(st.cnt[e0:e1].min()) < 2 * d else 0.01)
-            What_gu[e0:e1] = Wh.to("cpu", dt); bias_gu[e0:e1] = torch.einsum("enk,ek->en", W - Wh, mu).to("cpu", dt)
+            bias_gu[e0:e1] = torch.einsum("enk,ek->en", W - Wh, mu).to("cpu", dt)
+            # in place: the float experts are only needed by the first pass (the down projection's inputs, hf); the
+            # later passes read the experts' inputs, which do not depend on the experts' weights
+            ex.gate_up_proj.data[e0:e1] = Wh.to(dt)
             parts.append({k: v.cpu() for k, v in o.items()})
             eg["main"].append(er["main"].cpu()); eg["adapter"].append(er["adapter"].cpu())
             del W, Hc, Wh, o
@@ -263,9 +268,8 @@ def convert_layer(m, a, h, hq, hf, dev, dt):
         errs["mlp.experts.down_proj"] = _err_summary({"main": [er["main"]], "adapter": [er["adapter"]]}, Sdn.cnt)
         bias = (bias_gu.to(dev), torch.einsum("enk,ek->en", W - Wh, mu).to(dt))
         ex.down_proj.data = Wh.to(dt)
-        ex.gate_up_proj.data = What_gu.to(dev)
         ex.forward = lambda x, idx, w: experts_forward(ex, x, idx, w, None, bias)
-        del W, Hc, Wh, Sdn, What_gu
+        del W, Hc, Wh, Sdn
     for n, lin in dense:
         W = lin.weight.float()[None]
         Hc, mu, _ = S[n].centred(0, 1)
@@ -354,7 +358,7 @@ def main(argv=None):
         if rules is not None:
             fold_state(sd, rules[(cfg.layer_types[li], cfg.mlp_layer_types[li])], Q, dev, a.chunk)
         m = shell(cfg, li)
-        m.layers[0].load_state_dict(sd, strict=True)
+        m.layers[0].load_state_dict(sd, strict=True, assign=True)   # no second copy beside sd
         m.to(dev, dt)
         del sd
         out, errs = convert_layer(m, a, hs["h"], hs["hq"], hs["hf"], dev, dt)
