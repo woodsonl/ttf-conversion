@@ -379,6 +379,7 @@ def convert_layer(m, a, h, hq, hf, dev, dt, ho=None, hfc=None):
         errs["_router_fit"] = float((Wn - W0).norm() / W0.norm())
         gw.data = Wn.to(gw.dtype)
         del G, Cx, zf
+        ex.forward = lambda x, idx, w: experts_forward(ex, x, idx, w, None, bias)   # the converted experts again
     advance(h)
     if moe:
         ex.forward = lambda x, idx, w: (rq.append(idx.cpu()), experts_forward(ex, x, idx, w, None, bias))[1]
