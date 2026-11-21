@@ -246,8 +246,10 @@ def convert_layer(m, a, h, hq, hf, dev, dt):
     if moe:
         ex = L.mlp.experts
         E, I, d = ex.num_experts, ex.intermediate_dim, ex.hidden_dim
-        step = max(a.chunk, (min(a.experts_pass, E) // a.chunk) * a.chunk)
-        Sdn = Stats(E, I, dev, a.chunk)
+        # --experts-host: the experts' moments are held in host memory too, all experts in one pass
+        sdev = "cpu" if a.experts_host else dev
+        step = E if a.experts_host else max(a.chunk, (min(a.experts_pass, E) // a.chunk) * a.chunk)
+        Sdn = Stats(E, I, sdev, a.chunk)
         bias_gu = torch.empty(E, 2 * I, dtype=dt)
         parts, eg, cnt = [], {"main": [], "adapter": []}, 0
         fl, rf, rq, Hpool = {"a": [], "b": [], "e": []}, [], [], None
@@ -266,12 +268,12 @@ def convert_layer(m, a, h, hq, hf, dev, dt):
                 Spool.add(x.reshape(-1, d), [0, x.numel() // d])
             hooks.append(L.mlp.register_forward_pre_hook(pool_hook, with_kwargs=True))
         if moe:
-            Sgu = RangeStats(E, d, dev, a.chunk, p0, min(p0 + step, E))
+            Sgu = RangeStats(E, d, sdev, a.chunk, p0, min(p0 + step, E))
 
             def cap(xs, mid, offs, ws, Sgu=Sgu, first=first):
-                Sgu.add(xs, offs, ws)
+                Sgu.add(xs.to(sdev), offs, ws.to(sdev))
                 if first:
-                    Sdn.add(mid, offs, ws)
+                    Sdn.add(mid.to(sdev), offs, ws.to(sdev))
             ex.forward = lambda x, idx, w, cap=cap, io=not first: experts_forward(ex, x, idx, w, cap, None, io)
         for b0 in range(0, h.shape[0], a.mb):
             run(h[b0:b0 + a.mb])
@@ -292,10 +294,10 @@ def convert_layer(m, a, h, hq, hf, dev, dt):
         for e0 in range(p0, min(p0 + step, E), a.chunk):
             e1 = min(e0 + a.chunk, E)
             W = ex.gate_up_proj[e0:e1].to(dev).float()
-            Hc, mu, _ = st.centred(e0, e1)
+            Hc, mu = (t.to(dev) for t in st.centred(e0, e1)[:2])
             st.H[e0 // a.chunk] = None
             if Hpool is not None:   # an expert with few tokens leans on the layer's pooled covariance
-                wp = (a.pool * d / (a.pool * d + st.cnt[e0:e1].float()))[:, None, None]
+                wp = (a.pool * d / (a.pool * d + st.cnt[e0:e1].float().to(dev)))[:, None, None]
                 Hc = (1 - wp) * Hc + wp * Hpool
             o, Wh, er = convert_group(W, Hc, mu, a.rank, 0.05 if int(st.cnt[e0:e1].min()) < 2 * d else 0.01)
             if a.frank:
@@ -318,7 +320,7 @@ def convert_layer(m, a, h, hq, hf, dev, dt):
         for e0 in range(0, E, a.chunk):          # in chunks: all 512 Sante experts at once do not fit a 16 GB device
             e1 = min(e0 + a.chunk, E)
             W = ex.down_proj[e0:e1].to(dev).float()
-            Hc, mu, _ = Sdn.centred(e0, e1)
+            Hc, mu = (t.to(dev) for t in Sdn.centred(e0, e1)[:2])
             o, Wh, er = convert_group(W, Hc, mu, a.rank, 0.01)
             if a.frank:
                 fa, fb, Wh, ef = float_adapter(W, Wh, Hc, a.frank)
