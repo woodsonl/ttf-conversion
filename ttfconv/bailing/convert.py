@@ -184,9 +184,9 @@ def experts_forward(ex, x, idx, w, cap=None, bias=None):
     for e in range(E):
         a, b = offs[e], offs[e + 1]
         if b > a:
-            gate, up = F.linear(xs[a:b], ex.gate_up_proj[e], None if bias is None else bias[0][e]).chunk(2, -1)
+            gate, up = F.linear(xs[a:b], ex.gate_up_proj[e].to(x.device), None if bias is None else bias[0][e]).chunk(2, -1)
             mid[a:b] = ex.act_fn(gate) * up
-            o = F.linear(mid[a:b], ex.down_proj[e], None if bias is None else bias[1][e])
+            o = F.linear(mid[a:b], ex.down_proj[e].to(x.device), None if bias is None else bias[1][e])
             out.index_add_(0, tok[a:b], o * ws[a:b, None])
     if cap is not None:
         cap(xs, mid, offs, ws)
@@ -288,7 +288,7 @@ def convert_layer(m, a, h, hq, hf, dev, dt):
         st = Sgu.st
         for e0 in range(p0, min(p0 + step, E), a.chunk):
             e1 = min(e0 + a.chunk, E)
-            W = ex.gate_up_proj[e0:e1].float()
+            W = ex.gate_up_proj[e0:e1].to(dev).float()
             Hc, mu, _ = st.centred(e0, e1)
             st.H[e0 // a.chunk] = None
             if Hpool is not None:   # an expert with few tokens leans on the layer's pooled covariance
@@ -301,7 +301,7 @@ def convert_layer(m, a, h, hq, hf, dev, dt):
             bias_gu[e0:e1] = torch.einsum("enk,ek->en", W - Wh, mu).to("cpu", dt)
             # in place: the float experts are only needed by the first pass (the down projection's inputs, hf); the
             # later passes read the experts' inputs, which do not depend on the experts' weights
-            ex.gate_up_proj.data[e0:e1] = Wh.to(dt)
+            ex.gate_up_proj.data[e0:e1] = Wh.to(ex.gate_up_proj.device, dt)
             parts.append({k: v.cpu() for k, v in o.items()})
             eg["main"].append(er["main"].cpu()); eg["adapter"].append(er["adapter"].cpu())
             del W, Hc, Wh, o
@@ -314,14 +314,14 @@ def convert_layer(m, a, h, hq, hf, dev, dt):
         parts, eg, bias_dn = [], {"main": [], "adapter": []}, torch.empty(E, d, dtype=dt, device=dev)
         for e0 in range(0, E, a.chunk):          # in chunks: all 512 Sante experts at once do not fit a 16 GB device
             e1 = min(e0 + a.chunk, E)
-            W = ex.down_proj[e0:e1].float()
+            W = ex.down_proj[e0:e1].to(dev).float()
             Hc, mu, _ = Sdn.centred(e0, e1)
             o, Wh, er = convert_group(W, Hc, mu, a.rank, 0.01)
             if a.frank:
                 fa, fb, Wh, ef = float_adapter(W, Wh, Hc, a.frank)
                 fl["a"].append(fa); fl["b"].append(fb); fl["e"].append(ef)
             bias_dn[e0:e1] = torch.einsum("enk,ek->en", W - Wh, mu).to(dt)
-            ex.down_proj.data[e0:e1] = Wh.to(dt)
+            ex.down_proj.data[e0:e1] = Wh.to(ex.down_proj.device, dt)
             parts.append({k: v.cpu() for k, v in o.items()})
             eg["main"].append(er["main"].cpu()); eg["adapter"].append(er["adapter"].cpu())
             del W, Hc, Wh, o
@@ -382,6 +382,8 @@ def main(argv=None):
     ap.add_argument("--chunk", type=int, default=32, help="experts per GPTQ batch")
     ap.add_argument("--experts-pass", type=int, default=128, help="experts whose input moments are held at once")
     ap.add_argument("--no-fold", action="store_true")
+    ap.add_argument("--experts-host", action="store_true", help="keep a layer's routed experts in host memory: for a "
+                    "layer larger than the device")
     ap.add_argument("--pool", type=float, default=0.0, help="shrink each routed expert's input covariance toward the "
                     "layer's pooled one, with weight pool*d / (pool*d + the expert's tokens); 0 = off")
     ap.add_argument("--frank", type=int, default=0, help="rank of a closed-form float adapter on every ternary "
@@ -434,7 +436,16 @@ def main(argv=None):
             fold_state(sd, rules[(cfg.layer_types[li], cfg.mlp_layer_types[li])], Q, dev, a.chunk)
         m = shell(cfg, li)
         m.layers[0].load_state_dict(sd, strict=True, assign=True)   # no second copy beside sd
-        m.to(dev, dt)
+        ex = getattr(m.layers[0].mlp, "experts", None)
+        if a.experts_host and ex is not None:   # the routed experts stay in host memory, one expert at a time on dev
+            gu, dn = ex.gate_up_proj.data, ex.down_proj.data    # ponytail: unpinned; pin if the copies show in the time
+            ex.gate_up_proj.data = ex.down_proj.data = torch.empty(0)
+            m.to(dev, dt)
+            ex.gate_up_proj.data, ex.down_proj.data = gu.to(dt), dn.to(dt)
+            del gu, dn
+        else:
+            m.to(dev, dt)
+        del ex
         del sd
         out, errs = convert_layer(m, a, hs["h"], hs["hq"], hs["hf"], dev, dt)
         out["_float"] = {k: v.cpu() for k, v in m.layers[0].state_dict().items()

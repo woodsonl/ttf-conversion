@@ -51,7 +51,7 @@ def run(d, out, *extra):
             "--mb", "2", "--rank", "4", "--chunk", "2", "--experts-pass", "2", "--device", "cpu", *extra])
 
 
-@pytest.mark.parametrize("extra", [(), ("--no-fold",), ("--pool", "1", "--frank", "4")])
+@pytest.mark.parametrize("extra", [(), ("--no-fold",), ("--pool", "1", "--frank", "4", "--experts-host")])
 def test_converts_and_resumes(model_dir, tmp_path, extra):
     d, ref = model_dir
     out = tmp_path / "out"
