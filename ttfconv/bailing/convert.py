@@ -227,7 +227,7 @@ def float_state(sd, errs, name, fl, cnt):
 
 
 @torch.no_grad()
-def convert_layer(m, a, h, hq, hf, dev, dt):
+def convert_layer(m, a, h, hq, hf, dev, dt, ho=None):
     """m: shell with the (folded) float layer loaded. Returns (state dict, errors). In place: h (the calibration
     windows, which alone feed the statistics) and hq (held-out windows) advance through the converted layer, hf (the
     held-out windows' float stream) through the float one."""
@@ -283,7 +283,7 @@ def convert_layer(m, a, h, hq, hf, dev, dt):
             ex.forward = lambda x, idx, w: experts_forward(ex, x, idx, w)
         if first:
             if moe:     # the float model's expert choices on the held-out windows, for the agreement figure below
-                ex.forward = lambda x, idx, w: (rf.append(idx.cpu()), experts_forward(ex, x, idx, w))[1]
+                ex.forward = lambda x, idx, w: (rf.append((idx.cpu(), w.cpu())), experts_forward(ex, x, idx, w))[1]
             advance(hf)
             if moe and a.pool:
                 Hpool = Spool.centred(0, 1)[0]
@@ -352,9 +352,15 @@ def convert_layer(m, a, h, hq, hf, dev, dt):
     if moe:
         ex.forward = lambda x, idx, w: (rq.append(idx.cpu()), experts_forward(ex, x, idx, w, None, bias))[1]
     advance(hq)
+    if ho is not None:      # the converted layer under the float model's own expert choices and router weights
+        if moe:
+            it = iter(rf)
+            ex.forward = lambda x, idx, w: (lambda f: experts_forward(ex, x, f[0].to(x.device), f[1].to(x.device),
+                                                                      None, bias))(next(it))
+        advance(ho)
     if moe:     # per held-out token, the share of the float model's experts that the converted model also picks
         errs["_router_agreement"] = float(torch.cat([(f[:, :, None] == q[:, None, :]).any(-1).float().mean(-1)
-                                                     for f, q in zip(rf, rq)]).mean())
+                                                     for (f, _), q in zip(rf, rq)]).mean())
     return sd, errs
 
 
@@ -429,6 +435,7 @@ def main(argv=None):
         look = lambda i: (emb[i].float() @ Q.T if Q is not None else emb[i].float()).to(dt)
         hs = {"h": look(ids), "hq": look(ids_e)}
         hs["hf"] = hs["hq"].clone()
+        hs["ho"] = hs["hq"].clone()
         del emb
     else:
         hs = torch.load(hp, weights_only=True)
@@ -452,7 +459,7 @@ def main(argv=None):
             m.to(dev, dt)
         del ex
         del sd
-        out, errs = convert_layer(m, a, hs["h"], hs["hq"], hs["hf"], dev, dt)
+        out, errs = convert_layer(m, a, hs["h"], hs["hq"], hs["hf"], dev, dt, hs.get("ho"))
         out["_float"] = {k: v.cpu() for k, v in m.layers[0].state_dict().items()
                          if k not in out and k.rsplit(".", 1)[0] not in out}
         del m
@@ -474,6 +481,8 @@ def main(argv=None):
         ev = {"float": eval_loss(rd, cfg, hs["hf"], ids_e, Q, dev, a.mb),
               "ternary": eval_loss(rd, cfg, hs["hq"], ids_e, Q, dev, a.mb),
               "calibration_ternary": eval_loss(rd, cfg, hs["h"], ids, Q, dev, a.mb)}
+        if "ho" in hs:      # the ternary weights routed as the float model routes: what the routing drift costs
+            ev["ternary_float_routing"] = eval_loss(rd, cfg, hs["ho"], ids_e, Q, dev, a.mb)
         json.dump(ev, open(os.path.join(a.out, "eval.json"), "w"), indent=1)
         log("held-out loss: float %.4f, ternary %.4f" % (ev["float"], ev["ternary"]))
         open(os.path.join(a.out, "done"), "w").close()

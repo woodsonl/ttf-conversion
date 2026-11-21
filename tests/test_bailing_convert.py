@@ -62,6 +62,7 @@ def test_converts_and_resumes(model_dir, tmp_path, extra):
     ev = json.load(open(out / "eval.json"))
     assert abs(ev["float"] - ref) < 1e-3 * ref, (ev, ref)
     assert ev["ternary"] == ev["ternary"] and ev["ternary"] < 3 * ref
+    assert ev["ternary_float_routing"] < 3 * ref
     L = torch.load(out / "L5.pt", weights_only=True)
     assert {"wpacked", "row_scale", "col_scale", "ta_packed"} <= set(L["mlp.experts.gate_up_proj"])
     assert "input_layernorm.weight" in L["_float"] and "mlp.gate.weight" in L["_float"]
