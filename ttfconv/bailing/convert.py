@@ -18,7 +18,7 @@ Output: OUT/L{i}.pt = {name: TernaryExperts state_dict, "_float": the layer's re
 and, when all layers are done, OUT/eval.json: the loss on held-out windows of the float model and of the converted one.
   python -m ttfconv.bailing.convert HF_DIR DATA.bin OUT [--windows 64] [--rank 16] [--no-fold] [--device cpu]
 """
-import argparse, copy, json, os, re, time
+import argparse, copy, gc, json, os, re, time
 import numpy as np
 import torch
 import torch.nn as nn
@@ -372,6 +372,7 @@ def main(argv=None):
         out["_float"] = {k: v.cpu() for k, v in m.layers[0].state_dict().items()
                          if k not in out and k.rsplit(".", 1)[0] not in out}
         del m
+        gc.collect()        # the experts' forward closure holds its module in a cycle; free the layer before the next
         torch.save(hs, hp + ".tmp"); os.replace(hp + ".tmp", hp)
         open(os.path.join(a.out, "h.layer"), "w").write(str(li + 1))
         tmp = os.path.join(a.out, f"L{li}.pt.tmp")
