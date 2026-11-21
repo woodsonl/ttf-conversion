@@ -168,7 +168,7 @@ class RangeStats:
         self.st.add(x, [offs[e0]] * (e0 + 1) + offs[e0 + 1:e1 + 1] + [offs[e1]] * (self.st.E - e1), w)
 
 
-def experts_forward(ex, x, idx, w, cap=None, bias=None):
+def experts_forward(ex, x, idx, w, cap=None, bias=None, inputs_only=False):
     """BailingHybridExperts.forward with the tokens sorted by expert: cap(xs, mid, offs, ws) sees every expert's
     inputs, its down projection's inputs and the router weights; bias = (gate+up [E, 2I], down [E, d]) or None"""
     T, k = idx.shape
@@ -179,6 +179,9 @@ def experts_forward(ex, x, idx, w, cap=None, bias=None):
     ws = w.reshape(-1)[order].to(x.dtype)
     offs = [0] + torch.bincount(flat, minlength=E).cumsum(0).tolist()
     xs = x[tok]
+    if inputs_only:     # a statistics pass that reads the experts' inputs alone: no expert is run, the output is unused
+        cap(xs, None, offs, ws)
+        return torch.zeros_like(x)
     mid = torch.empty(xs.shape[0], ex.intermediate_dim, dtype=x.dtype, device=x.device)
     out = torch.zeros_like(x)
     for e in range(E):
@@ -269,7 +272,7 @@ def convert_layer(m, a, h, hq, hf, dev, dt):
                 Sgu.add(xs, offs, ws)
                 if first:
                     Sdn.add(mid, offs, ws)
-            ex.forward = lambda x, idx, w, cap=cap: experts_forward(ex, x, idx, w, cap)
+            ex.forward = lambda x, idx, w, cap=cap, io=not first: experts_forward(ex, x, idx, w, cap, None, io)
         for b0 in range(0, h.shape[0], a.mb):
             run(h[b0:b0 + a.mb])
         for hk in hooks:

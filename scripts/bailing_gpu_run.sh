@@ -11,7 +11,7 @@ if [ "$1" = status ]; then
   tail -n 3 "$3" | cut -c1-300; exit 0
 fi
 HF=$1; DATA=$2; OUT=$3; LOG=$4; shift 4
-pgrep -f "bailing[.]convert" > /dev/null && { echo "a run is active"; exit 1; }
+pgrep -f "bailing[.]convert .* $OUT( |\$)" > /dev/null && { echo "a run into $OUT is active"; exit 1; }
 $PY -c "import torch,sys;sys.exit(not torch.cuda.is_available())" 2>/dev/null || {
   V=$($PY -c "import torch;print(torch.__version__.split('+')[0])")
   .venv/bin/pip uninstall -y -q torch && .venv/bin/pip install -q "torch==$V" --index-url https://pypi.org/simple; }
