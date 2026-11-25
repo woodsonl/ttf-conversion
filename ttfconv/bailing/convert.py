@@ -462,8 +462,8 @@ def main(argv=None):
     cfg = load_config(a.hf)
     nl = a.layers or cfg.num_hidden_layers
     raw = json.load(open(os.path.join(a.hf, "config.json")))
-    lim = raw.get("expert_swiglu_limit_list", [0] * cfg.num_hidden_layers)
-    slim = raw.get("share_expert_swiglu_limit_list", [0] * cfg.num_hidden_layers)
+    lim = raw.get("expert_swiglu_limit_list") or [0] * cfg.num_hidden_layers
+    slim = raw.get("share_expert_swiglu_limit_list") or [0] * cfg.num_hidden_layers
     meta = {k: getattr(a, k) for k in ("windows", "seq", "eval_windows", "rank", "seed", "no_fold")}
     meta["swiglu_limit"] = True
     meta.update({k: getattr(a, k) for k in ("pool", "frank", "router_fit") if getattr(a, k)})
