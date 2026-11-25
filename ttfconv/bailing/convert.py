@@ -168,6 +168,23 @@ class RangeStats:
         self.st.add(x, [offs[e0]] * (e0 + 1) + offs[e0 + 1:e1 + 1] + [offs[e1]] * (self.st.E - e1), w)
 
 
+def act(g, u, lim):
+    """the clamped SwiGLU of the reference (vLLM / SGLang, ExLlamaV3 act_limit): min(silu(g), L) * clamp(u, -L, L);
+    L = 0 is the plain SwiGLU"""
+    s = F.silu(g)
+    return s.clamp(max=lim) * u.clamp(-lim, lim) if lim else s * u
+
+
+def set_limits(mlp, lim, slim):
+    """the layer's routed (lim) and shared (slim) expert clamps from config.json's swiglu limit lists, which
+    transformers' bailing_hybrid ignores"""
+    if hasattr(mlp, "experts"):
+        mlp.experts.act_limit = lim
+    if slim:
+        sh = mlp.shared_experts
+        sh.forward = lambda x, sh=sh: sh.down_proj(act(sh.gate_proj(x), sh.up_proj(x), slim))
+
+
 def experts_forward(ex, x, idx, w, cap=None, bias=None, inputs_only=False):
     """BailingHybridExperts.forward with the tokens sorted by expert: cap(xs, mid, offs, ws) sees every expert's
     inputs, its down projection's inputs and the router weights; bias = (gate+up [E, 2I], down [E, d]) or None"""
@@ -188,7 +205,7 @@ def experts_forward(ex, x, idx, w, cap=None, bias=None, inputs_only=False):
         a, b = offs[e], offs[e + 1]
         if b > a:
             gate, up = F.linear(xs[a:b], ex.gate_up_proj[e].to(x.device), None if bias is None else bias[0][e]).chunk(2, -1)
-            mid[a:b] = ex.act_fn(gate) * up
+            mid[a:b] = act(gate, up, getattr(ex, "act_limit", 0))
             o = F.linear(mid[a:b], ex.down_proj[e].to(x.device), None if bias is None else bias[1][e])
             out.index_add_(0, tok[a:b], o * ws[a:b, None])
     if cap is not None:
@@ -444,7 +461,11 @@ def main(argv=None):
     log = lambda *s: print(time.strftime("%H:%M:%S"), *s, flush=True)
     cfg = load_config(a.hf)
     nl = a.layers or cfg.num_hidden_layers
+    raw = json.load(open(os.path.join(a.hf, "config.json")))
+    lim = raw.get("expert_swiglu_limit_list", [0] * cfg.num_hidden_layers)
+    slim = raw.get("share_expert_swiglu_limit_list", [0] * cfg.num_hidden_layers)
     meta = {k: getattr(a, k) for k in ("windows", "seq", "eval_windows", "rank", "seed", "no_fold")}
+    meta["swiglu_limit"] = True
     meta.update({k: getattr(a, k) for k in ("pool", "frank", "router_fit") if getattr(a, k)})
     mp = os.path.join(a.out, "meta.json")
     if os.path.exists(mp):
@@ -484,6 +505,7 @@ def main(argv=None):
             fold_state(sd, rules[(cfg.layer_types[li], cfg.mlp_layer_types[li])], Q, dev, a.chunk)
         m = shell(cfg, li)
         m.layers[0].load_state_dict(sd, strict=True, assign=True)   # no second copy beside sd
+        set_limits(m.layers[0].mlp, lim[li], slim[li])
         ex = getattr(m.layers[0].mlp, "experts", None)
         if a.experts_host and ex is not None:   # the routed experts stay in host memory, one expert at a time on dev
             gu, dn = ex.gate_up_proj.data, ex.down_proj.data    # ponytail: unpinned; pin if the copies show in the time
