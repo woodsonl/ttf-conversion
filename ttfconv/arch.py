@@ -89,7 +89,18 @@ def cpu_reference_kernels():
             w = getattr(f, "__wrapped__", None)
             code = getattr(f, "__code__", None)
             if w is not None and code is not None and code.co_filename.endswith("hub_kernels.py"):
+                _KERNEL_WRAPPERS[mod, n] = f
                 setattr(mod, n, w)
+
+
+_KERNEL_WRAPPERS = {}
+
+
+def restore_kernels():
+    """undo cpu_reference_kernels: on CUDA the packages' kernels (fla's chunked delta rule) run in a fraction of the
+    memory and time of the torch reference paths"""
+    for (mod, n), f in _KERNEL_WRAPPERS.items():
+        setattr(mod, n, f)
 
 
 # ---------------------------------------------------------------------------------------------------------------------

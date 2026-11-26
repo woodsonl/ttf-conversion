@@ -24,7 +24,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..arch import discover, tiny_model, decoder_layers, signature, hf_class, _scale, _turn
+from ..arch import discover, tiny_model, decoder_layers, signature, hf_class, _scale, _turn, restore_kernels
 from ..fold import residual_q
 
 FLOAT_OUT = 64      # a linear with at most this many outputs stays float (b_proj, the MLA head gate)
@@ -479,6 +479,8 @@ def main(argv=None):
     if not a.no_fold:
         rules = fold_rules(cfg)
         Q = residual_q(cfg.hidden_size, torch.Generator().manual_seed(a.seed))
+    if dev.startswith("cuda"):
+        restore_kernels()
     data = np.memmap(a.data, dtype=np.uint32, mode="r")
     held = a.eval_windows * a.seq
     starts = np.random.default_rng(a.seed).integers(0, len(data) - held - a.seq - 1, a.windows)
