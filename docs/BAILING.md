@@ -6,9 +6,10 @@ is gated MLA; 512 routed experts + 1 shared per MoE layer, sigmoid `noaux_tc` ro
 
 ## transformers ships this family natively
 
-`BailingHybridConfig` / `BailingHybridForCausalLM` are in transformers from 5.23, in torch, with no `fla` dependency
-(`BailingHybridDeltaAttention` implements the gated delta rule itself). Architecture discovery, the fold check and the
-tiny-model tests therefore run on a CPU; nothing needs the model's remote modeling file, and nothing needs Triton.
+`BailingHybridConfig` / `BailingHybridForCausalLM` are in transformers from 5.23, in torch
+(`BailingHybridDeltaAttention` implements the gated delta rule itself and calls `fla`'s `chunk_kda` when
+`flash-linear-attention` is installed). Architecture discovery, the fold check and the tiny-model tests run on a CPU
+through the torch reference paths (`arch.cpu_reference_kernels`); nothing needs the model's remote modeling file.
 
 Two config details that cost an hour each if missed:
 
@@ -38,28 +39,46 @@ read off the residual stream:
 | KDA + MoE | 6 — q, k, v, f, g, b | o_proj | 4 — router, gate, up, experts |
 | gated MLA + MoE | 3 — q, kv_a, g | dense | 4 |
 
-So no fold-free fallback is needed for this family: the conversion can take `--ext ttfconv.fold` like the 27B did, and
-the float adapters (`--ext ttfconv.adapters`) are an addition on top of a folded model rather than a substitute for one.
-
 `pytest -q tests/test_bailing_fold.py` (CPU, ~40 s) is the regression test: it asserts exactness, the `w` gain form, and
-that both attention kinds were discovered.
+that both attention kinds were discovered. The full-size check runs in float32 against a 1e-4 tolerance, near which the
+attention branch sits on this model; `bailing.convert.fold_rules` tries up to three seeds, and each rule it returns has
+passed the same exact check.
 
-## What the conversion still needs
+## The converter
 
-Anchors are in place (`ttfconv/arch.py` discovery, `ttfconv/gptq.py` rounding, `ttfconv/adapters.py`), but no converter
-exists for this family yet:
+`python -m ttfconv.bailing.convert HF DATA OUT` runs layer-major over the native layers: one layer read from the
+safetensors, folded, its dense matrices and its routed experts (router-weighted input moments, `--experts-pass` experts
+held at a time) rounded with `q38`'s `convert_group`, written to `OUT/L{i}.pt`, and its fake-quantised weights written
+back so the next layer reads the converted stream. A stopped run resumes at the first missing `L{i}.pt`. The MTP layer
+is dropped. Options used below: `--pool` (shrink each expert's input covariance toward the pooled MoE input), `--frank`
+(closed-form float adapter of that rank beside every ternary matrix), `--router-fit` (closed-form router refit). The
+model's SwiGLU clamp (`expert_swiglu_limit_list`, `share_expert_swiglu_limit_list`) is applied as the checkpoint
+specifies it; a null list means no clamp. On CUDA the converter puts transformers' `fla` kernel wrappers back after the
+fold rules are built: on one 2,048-token window the torch reference KDA allocates 6.25 GiB against `fla`'s 0.30 GiB.
 
-- **The model builder.** ttfconv builds models through ttf-core's Qwen wrapper. The native `BailingHybrid` stores its
-  experts fused (`mlp.experts.gate_up_proj` of shape `[num_experts, out, in]`), where the Ling checkpoint on the Hub
-  keeps `experts.N.{gate,up,down}_proj` per expert. Pick one layout and make the reader, the per-layer stream and the
-  trainer agree on it; the converter's own `[1536, 2560]` / `[2560, 768]` shapes are what `ttf.q38.moe` already
-  handles.
-- **The stream driver.** `ttfconv/stream.py` is not family-specific in its structure (layer inputs stashed, one layer
-  resident, Hessians per layer), but it assumes `hf.model.layers` and a swappable module path.
-- **The MTP layer** (index 42, 3.07 B parameters, 2.4% of the model). Drop it; converting a speculative head buys
-  nothing and the trainer will not load it.
+## Ling-3.0-flash-Sante on one RTX 5080
+
+One RTX 5080 (16 GB), 123 GB host memory. Calibration on `wiki.bin`, sequences of 2,048, `--mb 1 --experts-pass 64
+--chunk 16`, rank 16, seed 777. Held-out loss in nats on the last 16,384 tokens of `wiki.bin` (8 windows of 2,048), the
+float model through the same path at 1.406 to 1.408 in every run. "Float routing" feeds each converted MoE layer the
+float model's routing decisions.
+
+| run | settings | ternary | float routing | wall time |
+|---|---|---|---|---|
+| base | 64 windows | 2.236 | 2.151 | 59 min |
+| pf64 | 64 windows, `--pool 1 --frank 16` | 2.172 | 2.094 | 62 min |
+| pf64r | repeat of pf64, stopped after layer 21 and resumed | 2.155 | 2.077 | |
+| rf64 | pf64 + `--router-fit` | 2.181 | 2.094 | 64 min |
+| w512 | 512 windows | 2.102 | 2.035 | 104 min |
+| w512pf | 512 windows, `--pool 1 --frank 16` | 2.032 | 1.983 | 107 min |
+
+Peak GPU memory 12.6 GiB on the MoE layers. The router refit moves the router weights 19% to 42% (relative norm) and
+keeps routing agreement at layers 32 to 41 between 0.70 and 0.74; its loss falls inside the pf64 / pf64r spread (0.017).
+Float routing recovers 0.078 (pf64r) and 0.087 (rf64) of a 0.75 to 0.78 gap to float, so routing accounts for about a
+tenth of the loss.
+
+## What is still open
+
 - **The export emitter.** `ttf.export` has no emitter or check for this architecture.
-
-Per-layer cost is friendlier than the 27B in one respect: an expert's K is 2560 against the 27B's 5120, so per-parameter
-GPTQ work halves. What goes up is matrix count (42,359 of them, most of them `[768, 2560]`), which makes small-matrix
-latency rather than arithmetic the risk.
+- **Recovery at full size.** Only Ling-3.0-tiny has recovery runs (`ttf-ternary`, `docs/BAILING.md`).
+- **Downstream evaluation** of the converted model beyond held-out loss.
